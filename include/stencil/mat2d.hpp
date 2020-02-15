@@ -141,6 +141,13 @@ public:
 
   const Shape &shape() const noexcept { return shape_; }
 
+  T *data() noexcept { return data_.data(); }
+  const T *data() const noexcept { return data_.data(); }
+  size_t size() const noexcept {
+    assert(shape().flatten() == data_.size());
+    return data_.size();
+  }
+
   bool operator==(const Mat2D &rhs) const noexcept {
     if (shape_ != rhs.shape_) {
       return false;

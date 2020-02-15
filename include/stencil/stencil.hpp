@@ -81,6 +81,9 @@ private:
   MethodFlags flags_;
   PlacementStrategy strategy_;
 
+  // kernel sender for same-domain sends
+  PeerAccessSender peerAccessSender_;
+
   // PeerCopySenders for same-rank exchanges
   std::vector<std::map<size_t, PeerCopySender>> peerCopySenders_;
 
@@ -89,12 +92,109 @@ private:
   std::vector<std::map<Dim3, StatefulRecver *>>
       remoteRecvers_; // remoteRecver_[domain][srcIdx] = recver
 
-  // kernel sender for same-domain sends
-  PeerAccessSender peerAccessSender_;
-
   std::vector<std::map<Dim3, ColocatedHaloSender>>
       coloSenders_; // vec[domain][dstIdx] = sender
   std::vector<std::map<Dim3, ColocatedHaloRecver>> coloRecvers_;
+
+  void print_comm_method(
+      Placement *placement, const std::vector<Message> &peerAccessOutbox,
+      const std::vector<std::vector<std::vector<Message>>> &peerCopyOutboxes,
+      std::vector<std::map<Dim3, std::vector<Message>>> coloOutboxes,
+      std::vector<std::map<Dim3, std::vector<Message>>> remoteOutboxes) {
+
+#define LINEARIZE(idx, dim) (idx.z * dim.y * dim.x + idx.y * dim.x + idx.x)
+
+    assert(placement);
+
+    const Dim3 dim = placement->dim();
+    int64_t matSize = dim.flatten();
+    // std::cerr << matSize << "\n";
+
+    Mat2D<char> mat(matSize, matSize, 0);
+
+    for (int64_t di = 0; di < domains_.size(); ++di) {
+      const Dim3 myIdx = placement->get_idx(rank_, di);
+
+      for (int z = -1; z <= 1; ++z) {
+        for (int y = -1; y <= 1; ++y) {
+          for (int x = -1; x <= 1; ++x) {
+            const Dim3 dir(x, y, z);
+            if (dir == Dim3(0, 0, 0)) {
+              continue;
+            }
+
+            const Dim3 dstIdx = (myIdx + dir).wrap(placement->dim());
+            const size_t dstSid = placement->get_subdomain_id(dstIdx);
+            const size_t dstRank = placement->get_rank(dstIdx);
+            int64_t myI = LINEARIZE(myIdx, dim);
+            int64_t dstI = LINEARIZE(dstIdx, dim);
+
+            if (rank_ == dstRank) {
+              for (auto &m : peerAccessOutbox) {
+                if (m.dir_ == dir) {
+                  assert(mat.at(myI, dstI) == 0 || mat.at(myI, dstI) == 'k');
+                  mat.at(myI, dstI) = 'k';
+                }
+              }
+            }
+
+            if (rank_ == dstRank) {
+              const std::vector<Message> &box = peerCopyOutboxes[di][dstSid];
+              for (auto &m : box) {
+                if (m.dir_ == dir) {
+                  assert(mat.at(myI, dstI) == 0 || mat.at(myI, dstI) == 'p');
+                  mat.at(myI, dstI) = 'p';
+                }
+              }
+            }
+            if (rank_ != dstRank) {
+              auto &box = coloOutboxes[di][dstIdx];
+              for (auto &m : box) {
+                if (m.dir_ == dir) {
+                  assert(mat.at(myI, dstI) == 0 || mat.at(myI, dstI) == 'c');
+                  mat.at(myI, dstI) = 'c';
+                }
+              }
+            }
+            if (rank_ != dstRank) {
+              auto &box = remoteOutboxes[di][dstIdx];
+              for (auto &m : box) {
+                if (m.dir_ == dir) {
+                  assert(mat.at(myI, dstI) == 0 || mat.at(myI, dstI) == 'r');
+                  mat.at(myI, dstI) = 'r';
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (0 == rank_) {
+      MPI_Reduce(MPI_IN_PLACE, mat.data(), mat.size(), MPI_BYTE, MPI_BOR, 0,
+                 MPI_COMM_WORLD);
+    } else {
+      MPI_Reduce(mat.data(), mat.data(), mat.size(), MPI_BYTE, MPI_BOR, 0,
+                 MPI_COMM_WORLD);
+    }
+
+    if (0 == rank_) {
+      std::cerr << "method matrix:\n";
+      for (int64_t i = 0; i < mat.shape().y; ++i) {
+        for (int64_t j = 0; j < mat.shape().x; ++j) {
+          if (mat.at(i, j)) {
+            std::cerr << mat.at(i, j) << " ";
+          } else {
+            std::cerr << "0 ";
+          }
+        }
+        std::cerr << "\n";
+      }
+    }
+#undef LINEARIZE
+  }
+
+  void print_comm_volume(Placement *placement) { assert(false); }
 
 public:
   DistributedDomain(size_t x, size_t y, size_t z)
@@ -493,6 +593,13 @@ public:
 #endif
 
     // summarize communication plan
+    MPI_Barrier(MPI_COMM_WORLD);
+    print_comm_method(placement, peerAccessOutbox, peerCopyOutboxes, coloOutboxes, remoteOutboxes);
+    MPI_Barrier(MPI_COMM_WORLD);
+    print_comm_volume(placement);
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // summarize communication plan
     std::string planFileName = "plan_" + std::to_string(rank_) + ".txt";
     std::ofstream planFile(planFileName, std::ofstream::out);
 
@@ -512,7 +619,8 @@ public:
       for (int qi = 0; qi < domains_[m.srcGPU_].num_data(); ++qi) {
         numBytes += domains_[m.srcGPU_].halo_bytes(m.dir_, qi);
       }
-      planFile << m.srcGPU_ << "->" << m.dstGPU_ << " " << m.dir_ << " " << numBytes << "B\n";
+      planFile << m.srcGPU_ << "->" << m.dstGPU_ << " " << m.dir_ << " "
+               << numBytes << "B\n";
     }
     planFile << "\n";
 
